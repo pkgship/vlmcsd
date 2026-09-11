@@ -1,0 +1,26 @@
+Source: vlmcsd
+Section: net
+Priority: optional
+Maintainer: line <tzwlink@163.com>
+Build-Depends: debhelper-compat (= 13),
+               gcc,
+               libc6-dev,
+               make
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/pkgship/vlmcsd
+Vcs-Browser: https://github.com/pkgship/vlmcsd
+Vcs-Git: https://github.com/pkgship/vlmcsd.git
+
+Package: vlmcsd
+Architecture: any
+Multi-Arch: foreign
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Description: Microsoft-compatible KMS server emulator
+ vlmcsd is an independent implementation of a Microsoft KMS (Key Management
+ Service) server. It speaks KMS protocol versions 4, 5 and 6 and activates
+ Windows and Office volume license products.
+ .
+ KMS activation is not permanent. Clients must re-activate every 180 days,
+ so a KMS server has to stay reachable in the network.

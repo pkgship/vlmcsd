@@ -1,0 +1,9 @@
+.git
+.github
+bin
+build
+lib
+dist
+npm
+artifacts
+publish

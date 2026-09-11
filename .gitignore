@@ -1,13 +1,26 @@
 VisualStudio/
-bin/
-build/
+# Build output of the top-level GNUmakefile, anchored so that the npm package's
+# own bin/ and lib/ directories are not swallowed.
+/bin/
+/build/
 buildroot-configs/
 floppy/
 hotbird64-mass-build/
-lib/
+/lib/
 src/VisualStudio-Linux-Remote/
 *.vcxproj*
 *.html
 *.pdf
 *.txt
 .vscode/
+dist/
+artifacts/
+publish/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/tmp/
+debian/vlmcsd/
+.tmp/

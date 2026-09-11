@@ -1,0 +1,8 @@
+vlmcsd (1113) unstable; urgency=medium
+
+  * Initial packaging of vlmcsd. Based on the upstream release
+    vlmcsd-1113-2020-03-28-Hotbird64.
+  * Install vlmcsd, vlmcs and vlmcsdmulti together with their manual pages.
+  * Ship a systemd service unit that runs vlmcsd in the foreground.
+
+ -- line <tzwlink@163.com>  Fri, 11 Sep 2026 09:50:01 +0800

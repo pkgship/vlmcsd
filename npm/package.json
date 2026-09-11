@@ -1,0 +1,37 @@
+{
+  "name": "@pkgship/vlmcsd",
+  "version": "0.0.0",
+  "description": "Microsoft-compatible KMS server emulator",
+  "license": "LGPL-2.1-or-later",
+  "homepage": "https://github.com/pkgship/vlmcsd#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pkgship/vlmcsd.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pkgship/vlmcsd/issues"
+  },
+  "bin": {
+    "vlmcsd": "bin/vlmcsd.js",
+    "vlmcs": "bin/vlmcs.js",
+    "vlmcsdmulti": "bin/vlmcsdmulti.js"
+  },
+  "files": [
+    "bin",
+    "lib"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@pkgship/vlmcsd-darwin-amd64": "0.0.0",
+    "@pkgship/vlmcsd-darwin-arm64": "0.0.0",
+    "@pkgship/vlmcsd-freebsd-amd64": "0.0.0",
+    "@pkgship/vlmcsd-linux-386": "0.0.0",
+    "@pkgship/vlmcsd-linux-amd64": "0.0.0",
+    "@pkgship/vlmcsd-linux-arm": "0.0.0",
+    "@pkgship/vlmcsd-linux-arm64": "0.0.0",
+    "@pkgship/vlmcsd-windows-amd64": "0.0.0",
+    "@pkgship/vlmcsd-windows-arm64": "0.0.0"
+  }
+}

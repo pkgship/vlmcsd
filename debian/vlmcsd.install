@@ -1,0 +1,5 @@
+bin/vlmcsd usr/bin/
+bin/vlmcs usr/bin/
+bin/vlmcsdmulti usr/bin/
+etc/vlmcsd.ini etc/vlmcsd/
+etc/vlmcsd.kmd etc/vlmcsd/

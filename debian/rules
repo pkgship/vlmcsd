@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+VERSION := $(shell dpkg-parsechangelog --show-field Version)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) allmulti VLMCSD_VERSION="$(VERSION)"
+
+# The upstream build system has no install target; debian/vlmcsd.install and
+# debian/vlmcsd.manpages place the files instead.
+override_dh_auto_install:
+	@true

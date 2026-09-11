@@ -1,24 +1,25 @@
 #!/bin/sh
-# Build Docker image for vlmcsd KMS server
-set -e
+# Build the vlmcsd container image for the local architecture.
+#
+# Usage: [VERSION=<version>] [IMAGE=<name>] ./build.sh
+set -eu
 
-IMAGE_NAME="vlmcsd"
-TAG="latest"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+IMAGE=${IMAGE:-vlmcsd}
 
-# Try to get version from git tag
-if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
-    GIT_TAG=$(git describe --tags --always 2>/dev/null || true)
-    if [ -n "$GIT_TAG" ]; then
-        TAG="$GIT_TAG"
-    fi
+# debian/changelog holds the version of record (keep the Dockerfile ARG in sync).
+VERSION=${VERSION:-$(sed -n '1s/^[^(]*(\([^)]*\)).*/\1/p' "$ROOT/debian/changelog")}
+
+if [ -z "$VERSION" ]; then
+	echo "error: cannot read a version from debian/changelog" >&2
+	exit 1
 fi
 
-echo "Building ${IMAGE_NAME}:${TAG} ..."
-docker build -t "${IMAGE_NAME}:${TAG}" -t "${IMAGE_NAME}:latest" .
+docker build \
+	--build-arg "VLMCSD_VERSION=$VERSION" \
+	--tag "$IMAGE:$VERSION" \
+	--tag "$IMAGE:latest" \
+	"$ROOT"
 
-echo ""
-echo "Done. Run with:"
-echo "  docker run -d -p 1688:1688 --name vlmcsd ${IMAGE_NAME}:latest"
-echo ""
-echo "Test with:"
-echo "  docker exec vlmcsd vlmcsd -V"
+printf '\nBuilt %s:%s (also tagged %s:latest)\n' "$IMAGE" "$VERSION" "$IMAGE"
+printf 'Run with: docker run -d -p 1688:1688 --name vlmcsd %s:latest\n' "$IMAGE"

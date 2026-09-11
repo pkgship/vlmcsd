@@ -1,0 +1,475 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  # Keep in sync with the Dockerfile's ALPINE_VERSION default.
+  ALPINE_VERSION: "3.24"
+  # Pinned on purpose: llvm-mingw is the only source of a Windows ARM64 cross
+  # toolchain, and its layout is version specific.
+  LLVM_MINGW_VERSION: "20260908"
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # debian/changelog is the version of record for untagged builds; a release
+      # tag wins over it so the .deb, the container image, the npm packages and
+      # the release assets all report the same version.
+      - name: Read version
+        id: read
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(sed -n '1s/^[^(]*(\([^)]*\)).*/\1/p' debian/changelog)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "::error::cannot determine a version"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+  docker:
+    name: Docker image
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve registry names
+        id: registries
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          publish=false
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            publish=true
+            echo "username=${DOCKERHUB_USERNAME}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          {
+            echo "images<<EOF"
+            echo "ghcr.io/${GITHUB_REPOSITORY}"
+            if [ "${publish}" = "true" ]; then
+              echo "${DOCKERHUB_USERNAME}/vlmcsd"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.registries.outputs.images }}
+          tags: |
+            type=match,pattern=v(.*),group=1
+            type=edge,branch=main
+            type=ref,event=pr
+            type=sha,format=short
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.registries.outputs.publish == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ steps.registries.outputs.username }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          build-args: |
+            VLMCSD_VERSION=${{ needs.version.outputs.version }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+  deb:
+    name: .deb (${{ matrix.arch }})
+    needs: version
+    runs-on: ubuntu-latest
+    # One package per architecture, built on Debian oldstable. vlmcsd links
+    # nothing but libc, so a single build installs on Debian 12/13 and
+    # Ubuntu 24.04/26.04; the glibc floor is recorded via ${shlibs:Depends}.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Build package on Debian 12
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          docker run --rm \
+            --platform "linux/${{ matrix.arch }}" \
+            --env "VERSION=${VERSION}" \
+            --volume "${GITHUB_WORKSPACE}/..:/src" \
+            --workdir "/src/$(basename "${GITHUB_WORKSPACE}")" \
+            debian:12 \
+            sh -euxc '
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential debhelper
+              current="$(dpkg-parsechangelog --show-field Version)"
+              if [ -n "${VERSION}" ] && [ "${VERSION}" != "${current}" ]; then
+                maintainer="$(dpkg-parsechangelog --show-field Maintainer)"
+                {
+                  printf "vlmcsd (%s) unstable; urgency=medium\n\n" "${VERSION}"
+                  printf "  * Automated build for tag v%s.\n\n" "${VERSION}"
+                  printf " -- %s  %s\n\n" "${maintainer}" "$(date -R)"
+                  cat debian/changelog
+                } > debian/changelog.new
+                mv debian/changelog.new debian/changelog
+              fi
+              dpkg-buildpackage -us -uc -b
+            '
+
+      - name: Collect package
+        run: |
+          mkdir -p dist
+          mv ../vlmcsd_*.deb dist/
+          ls -l dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # Standalone binaries for the npm packages and the release assets. Each job
+  # uploads `bin-<platform>`, holding the raw binaries and one archive; the
+  # platform names are listed in npm/lib/platforms.js.
+  binaries-linux:
+    name: bin linux-${{ matrix.arch }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, platform: linux/amd64 }
+          - { arch: arm64, platform: linux/arm64 }
+          - { arch: arm, platform: linux/arm/v7 }
+          - { arch: "386", platform: linux/386 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      # Built under Alpine, so the binaries are musl static: no libc and no
+      # dynamic loader to depend on, one artifact runs on every distribution of
+      # that architecture.
+      - name: Build
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            --env VERSION \
+            --volume "${PWD}:/src" \
+            --workdir /src \
+            "alpine:${{ env.ALPINE_VERSION }}" \
+            sh -euxc '
+              apk add --no-cache build-base
+              make -j"$(nproc)" allmulti \
+                CRYPTO=internal FEATURES=full \
+                VLMCSD_VERSION="${VERSION}" \
+                LDFLAGS=-static
+              mkdir -p dist
+              cp bin/vlmcsd bin/vlmcs bin/vlmcsdmulti dist/
+              chmod 755 dist/vlmcsd dist/vlmcs dist/vlmcsdmulti
+              tar -czf "dist/vlmcsd-${VERSION}-linux-${{ matrix.arch }}.tar.gz" \
+                -C dist vlmcsd vlmcs vlmcsdmulti
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-linux-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+
+  binaries-darwin:
+    name: bin darwin-${{ matrix.arch }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: macos-15-intel }
+          - { arch: arm64, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      # The earliest macOS that ships on Apple Silicon, so one artifact covers
+      # every macOS a Node.js release still supports.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          make allmulti CRYPTO=internal FEATURES=full VLMCSD_VERSION="${VERSION}"
+          mkdir -p dist
+          cp bin/vlmcsd bin/vlmcs bin/vlmcsdmulti dist/
+          chmod 755 dist/vlmcsd dist/vlmcs dist/vlmcsdmulti
+          tar -czf "dist/vlmcsd-${VERSION}-darwin-${{ matrix.arch }}.tar.gz" \
+            -C dist vlmcsd vlmcs vlmcsdmulti
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-darwin-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+
+  binaries-windows:
+    name: bin windows-${{ matrix.arch }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              arch: amd64,
+              target: x86_64-w64-mingw32,
+              cc: x86_64-w64-mingw32-gcc,
+              ar: x86_64-w64-mingw32-ar,
+            }
+          - {
+              arch: arm64,
+              target: aarch64-w64-mingw32,
+              cc: aarch64-w64-mingw32-clang,
+              ar: aarch64-w64-mingw32-ar,
+            }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install mingw-w64
+        if: matrix.arch == 'amd64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 zip
+
+      # Debian only packages i686 and x86_64 mingw-w64, so Windows ARM64 comes
+      # from llvm-mingw, fetched straight from its releases rather than through
+      # a third party action.
+      - name: Install llvm-mingw
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zip
+          curl -fsSL -o /tmp/llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          sudo mkdir -p /opt/llvm-mingw
+          sudo tar -xJf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
+          echo /opt/llvm-mingw/bin >> "$GITHUB_PATH"
+
+      # The makefile picks its platform branch by grepping `$CC -v` for
+      # substrings, which llvm-mingw's clang defeats: it reports
+      # aarch64-w64-windows-gnu, and that "gnu" matches the Hurd test, which
+      # sets ELF and adds -Wl,-z,norelro that a COFF linker rejects; the missing
+      # "mingw" also costs it ntservice.c, wintap.c and every Windows import
+      # library. Naming the canonical GNU triple puts both toolchains on the
+      # MinGW branch, where the x86_64 one already lands.
+      - name: Build
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          make -j"$(nproc)" allmulti \
+            TARGETPLATFORM=${{ matrix.target }} \
+            CC=${{ matrix.cc }} \
+            AR=${{ matrix.ar }} \
+            CRYPTO=internal FEATURES=full \
+            VLMCSD_VERSION="${VERSION}" \
+            LDFLAGS=-static \
+            PROGRAM_NAME=bin/vlmcsd.exe \
+            CLIENT_NAME=bin/vlmcs.exe \
+            MULTI_NAME=bin/vlmcsdmulti.exe
+          mkdir -p dist
+          cp bin/vlmcsd.exe bin/vlmcs.exe bin/vlmcsdmulti.exe dist/
+          (cd dist && zip -q "vlmcsd-${VERSION}-windows-${{ matrix.arch }}.zip" vlmcsd.exe vlmcs.exe vlmcsdmulti.exe)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-windows-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+
+  binaries-freebsd:
+    name: bin freebsd-amd64
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14"
+          arch: x86_64
+          # The project's tracked Makefile only redirects BSD make to gmake.
+          prepare: pkg install -y gmake
+          run: |
+            gmake allmulti CRYPTO=internal FEATURES=full VLMCSD_VERSION="${{ needs.version.outputs.version }}"
+            mkdir -p dist
+            cp bin/vlmcsd bin/vlmcs bin/vlmcsdmulti dist/
+            chmod 755 dist/vlmcsd dist/vlmcs dist/vlmcsdmulti
+            tar -czf "dist/vlmcsd-${{ needs.version.outputs.version }}-freebsd-amd64.tar.gz" \
+              -C dist vlmcsd vlmcs vlmcsdmulti
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-freebsd-amd64
+          path: dist
+          if-no-files-found: error
+
+  npm:
+    name: npm
+    needs:
+      [
+        version,
+        binaries-linux,
+        binaries-darwin,
+        binaries-windows,
+        binaries-freebsd,
+      ]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Needed for --provenance.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: bin-*
+          path: artifacts
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          # npm's guidance for release builds; the publish below authenticates
+          # with OIDC rather than through a cached credential.
+          package-manager-cache: false
+
+      # No token: each package has this repository registered as its trusted
+      # publisher (see npm/scripts/bootstrap.js), so npm mints short-lived
+      # credentials from the id-token permission above.
+      #
+      # Publishing is idempotent: re-running a release uploads whatever is
+      # missing and leaves already published versions alone.
+      - name: Publish
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          node npm/scripts/build-packages.js --version "${VERSION}" --dist artifacts --out publish
+          while IFS=$'\t' read -r dir name version; do
+            [ -n "${dir}" ] || continue
+            if npm view "${name}@${version}" version >/dev/null 2>&1 </dev/null; then
+              echo "already published: ${name}@${version}"
+            else
+              npm publish "publish/${dir}" --access public --provenance </dev/null
+            fi
+          done < publish/.packages
+
+  release:
+    name: GitHub Release
+    needs:
+      [
+        version,
+        deb,
+        binaries-linux,
+        binaries-darwin,
+        binaries-windows,
+        binaries-freebsd,
+      ]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -t assets < <(find dist -type f \( -name '*.deb' -o -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::no release assets were produced"
+            exit 1
+          fi
+          printf '%s\n' "${assets[@]}"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --generate-notes --title "${GITHUB_REF_NAME}"
+          fi
